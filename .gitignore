@@ -1,0 +1,25 @@
+env/
+drug-project/
+venv/
+*.venv
+*.env
+full_database.xml
+*.xml.zip
+rawdata/full database.xml
+*.csv
+
+*.pt
+*.pkl
+
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+.vscode/
+
+.ipynb_checkpoints
+
+build/
+dist/
+*.egg-info/
