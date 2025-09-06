@@ -1,130 +1,205 @@
-import xml.etree.ElementTree as ET
-import pandas as pd
-from tqdm import tqdm
-import spacy
+#!/usr/bin/env python3
+"""
+xml_to_csv.py - Production DrugBank XML -> CSV parser (scispaCy-only, start/end parsing)
+
+Usage:
+  python xml_to_csv.py --xml "rawdata/full database.xml" --out "clean_output"
+"""
+import os, sys, re, json, argparse
 from collections import Counter
+import pandas as pd
+from lxml import etree
+import spacy
 
-print("--- Step 1 (Final Definitive Version): Starting NLP Parsing ---")
+try:
+    from fuzzywuzzy import fuzz
+    FUZZY_OK = True
+except Exception:
+    FUZZY_OK = False
 
-# --- Configuration for Final Cleaning ---
-# Using the purpose-built BC5CDR model, we can now filter for the precise "DISEASE" label.
-VALID_ENTITY_LABELS = {"DISEASE"}
-
-# --- 1. Load the scispaCy BC5CDR NLP Model ---
 MODEL_NAME = "en_ner_bc5cdr_md"
-print(f"Loading the scispaCy NLP model ({MODEL_NAME})...")
-try:
-    nlp = spacy.load(MODEL_NAME)
-    print("NLP model loaded successfully.")
-except OSError:
-    print(f"\nERROR: scispaCy model '{MODEL_NAME}' not found.")
-    print("Please run the following command in your 'drug-project' conda environment:")
-    print("pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.3/en_ner_bc5cdr_md-0.5.3.tar.gz")
-    exit()
+REQUIRED_LABEL = "DISEASE"
 
-def normalize_entity(text):
-    """Performs final cleaning and normalization on an entity name."""
-    text = text.lower().strip()
-    # Simple plural handling
-    if text.endswith('s') and len(text) > 3 and text[-2] not in 'is':
-        return text[:-1]
-    return text
+DEFAULT_XML_PATH = "rawdata/full database.xml"
+DEFAULT_OUT = "clean_output"
+DEFAULT_MIN_SUPPORT = 1
+DEFAULT_MIN_ENTITY_LEN = 4
+DEFAULT_FUZZY_THRESHOLD = 88
 
-# --- Main Parsing Logic ---
-def count_drug_tags(filename):
-    """Efficiently counts the number of <drug> tags for the progress bar."""
-    count = 0
+def local_name(tag):
+    return etree.QName(tag).localname if tag else ""
+
+def normalize_text(s: str) -> str:
+    if not isinstance(s, str): return ""
+    s = s.strip().lower()
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"[^a-z0-9\s\-\+/]", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    s = re.sub(r"\b(disease|syndrome|disorder|condition|infection|cancer|tumor|tumour)\b$", "", s).strip()
+    return s
+
+def keep_entity(t: str, min_len: int) -> bool:
+    if not t or not isinstance(t, str): return False
+    t = t.strip()
+    if t.isnumeric(): return False
+    if len(t) < min_len: return False
+    if t in {"disease","disorder","syndrome","infection","condition"}: return False
+    if re.fullmatch(r"[-\s]+", t): return False
+    return True
+
+def fuzzy_cluster(names, threshold=88):
+    if not FUZZY_OK: return {n: n for n in names}
+    names = list(dict.fromkeys(names))
+    clusters = []
+    for n in names:
+        placed = False
+        for c in clusters:
+            if fuzz.token_sort_ratio(c[0], n) >= threshold:
+                c.append(n); placed = True; break
+        if not placed: clusters.append([n])
+    mapping = {}
+    for c in clusters:
+        canon = sorted(c, key=lambda x:(len(x),x))[0]
+        for m in c: mapping[m] = canon
+    return mapping
+
+def parse_drugbank(xml_path, out_dir=DEFAULT_OUT,
+                   min_support=DEFAULT_MIN_SUPPORT,
+                   fuzzy_threshold=DEFAULT_FUZZY_THRESHOLD,
+                   min_entity_len=DEFAULT_MIN_ENTITY_LEN,
+                   cluster_diseases=True):
+    if not os.path.exists(xml_path):
+        raise FileNotFoundError(xml_path)
+
     try:
-        for event, elem in ET.iterparse(filename, events=('end',)):
-            if elem.tag == '{http://www.drugbank.ca}drug':
-                count += 1
-            elem.clear()
-    except (ET.ParseError, FileNotFoundError) as e:
-        print(f"Error reading XML during count: {e}")
-        return 0
-    return count
+        nlp = spacy.load(MODEL_NAME)
+    except Exception as e:
+        print(f"ERROR: Could not load model '{MODEL_NAME}': {e}", file=sys.stderr)
+        sys.exit(1)
 
-XML_FILE_PATH = 'rawdata/full database.xml'
-num_drugs = count_drug_tags(XML_FILE_PATH)
-print(f"Found {num_drugs} total drug entries to process.")
+    print(f"Loaded scispaCy model '{MODEL_NAME}'. Starting parse...")
 
-# --- Single Pass Data Extraction ---
-print("\n--- Starting Data Extraction ---")
-drugs_data = []
-targets_data = []
-drug_target_edges = []
-drug_disease_edges = []
-seen_targets = set()
-all_diseases = set()
-debug_count = 0
+    drugs, targets, drug_target_edges, drug_disease_edges = [], {}, [], []
+    disease_counter = Counter()
 
-try:
-    with open(XML_FILE_PATH, 'rb') as f:
-        context = ET.iterparse(f, events=('end',))
-        for event, elem in tqdm(context, total=num_drugs, desc="Parsing DrugBank XML"):
-            if elem.tag == '{http://www.drugbank.ca}drug':
-                ns = {'db': 'http://www.drugbank.ca'}
-                
-                drugbank_id_elem = elem.find('db:drugbank-id[@primary="true"]', ns)
-                if drugbank_id_elem is None or not drugbank_id_elem.text:
-                    elem.clear()
-                    continue
-                
-                drug_id = drugbank_id_elem.text
-                drug_name_elem = elem.find('db:name', ns)
-                drug_name = drug_name_elem.text if drug_name_elem is not None else "Unknown"
-                drugs_data.append({'id': drug_id, 'name': drug_name})
+    context = etree.iterparse(xml_path, events=("start","end"), recover=True, huge_tree=True)
 
-                for target in elem.findall('db:targets/db:target', ns):
-                    target_id_elem = target.find('db:id', ns)
-                    if target_id_elem is not None and target_id_elem.text:
-                        target_id = target_id_elem.text
-                        target_name_elem = target.find('db:name', ns)
-                        target_name = target_name_elem.text if target_name_elem is not None else "Unknown"
-                        if target_id not in seen_targets:
-                            targets_data.append({'id': target_id, 'name': target_name})
-                            seen_targets.add(target_id)
-                        drug_target_edges.append({'drug_id': drug_id, 'target_id': target_id})
+    in_drug = False
+    drug = {}
+    texts = []
 
-                indication_elem = elem.find('db:indication', ns)
-                if indication_elem is not None and indication_elem.text:
-                    doc = nlp(indication_elem.text)
-                    
-                    # Debug the first 5 drugs with entities
-                    if debug_count < 5 and doc.ents:
-                        print(f"\n--- DEBUG: Entities for Drug {drug_id} ---")
-                        for ent in doc.ents:
-                            print(f"  - Found Entity: '{ent.text}', Label: '{ent.label_}'")
-                        debug_count += 1
+    for event, elem in context:
+        ln = local_name(elem.tag).lower()
 
+        if event == "start" and ln == "drug":
+            in_drug = True
+            drug = {"id": None, "name": None, "targets": []}
+            texts = []
+
+        elif event == "end" and ln == "drug":
+            if drug.get("id"):
+                drugs.append({"id": drug["id"], "name": drug["name"] or drug["id"]})
+                for tid,tname,uniprot in drug["targets"]:
+                    if tid not in targets:
+                        targets[tid] = {"id": tid, "name": tname, "uniprot": uniprot}
+                    drug_target_edges.append({"drug_id": drug["id"], "target_id": tid})
+
+                for block in texts[:3]:
+                    doc = nlp(block)
                     for ent in doc.ents:
-                        if ent.label_ in VALID_ENTITY_LABELS:
-                            normalized_entity = normalize_entity(ent.text)
-                            if len(normalized_entity) > 3 and not normalized_entity.isnumeric():
-                                all_diseases.add(normalized_entity)
-                                drug_disease_edges.append({'drug_id': drug_id, 'disease_name': normalized_entity})
-                
-                elem.clear()
-except FileNotFoundError:
-    print(f"ERROR: XML file not found at '{XML_FILE_PATH}'")
-    exit()
+                        if ent.label_.upper() == REQUIRED_LABEL:
+                            norm = normalize_text(ent.text)
+                            if keep_entity(norm, min_entity_len):
+                                disease_counter[norm]+=1
+                                drug_disease_edges.append({"drug_id": drug["id"], "disease_name": norm})
 
-# --- Save results to CSV files ---
-print(f"\nParsing complete. Found {len(all_diseases)} unique, high-quality disease/symptom nodes.")
+            in_drug = False
+            elem.clear()
 
-df_drugs = pd.DataFrame(drugs_data)
-df_targets = pd.DataFrame(targets_data)
-df_diseases = pd.DataFrame(list(all_diseases), columns=['name'])
-df_drug_target = pd.DataFrame(drug_target_edges)
-df_drug_disease = pd.DataFrame(drug_disease_edges).drop_duplicates()
+        elif in_drug:
+            if ln == "drugbank-id" and elem.get("primary") == "true":
+                txt = "".join(elem.itertext()).strip()
+                if txt: drug["id"] = txt
+            elif ln == "drugbank-id" and not drug.get("id"):
+                txt = "".join(elem.itertext()).strip()
+                if txt: drug["id"] = txt
+            elif ln == "name" and not drug.get("name"):
+                txt = "".join(elem.itertext()).strip()
+                if txt: drug["name"] = txt
+            elif ln == "target":
+                tid, tname, uniprot = None, None, None
+                for sub in elem.iter():
+                    lns = local_name(sub.tag).lower()
+                    if lns == "id": tid = "".join(sub.itertext()).strip()
+                    if lns == "name": tname = "".join(sub.itertext()).strip()
+                    if lns in {"xref","xrefs"}:
+                        res, xid = None, None
+                        for xx in sub.iter():
+                            lx = local_name(xx.tag).lower()
+                            if lx == "resource" and xx.text: res = xx.text.lower()
+                            if lx == "id" and xx.text: xid = xx.text.strip()
+                        if res and "uniprot" in res and xid: uniprot = xid
+                if tid:
+                    drug["targets"].append((tid,tname,uniprot))
+                elif tname:
+                    tmpid = f"name:{tname}"
+                    drug["targets"].append((tmpid,tname,uniprot))
+            elif ln in {"indication","indications","description","pharmacology"}:
+                txt = "".join(elem.itertext()).strip()
+                if txt: texts.append(txt)
 
-if df_diseases.empty or df_drug_disease.empty:
-    print("\nWARNING: No valid disease data was extracted.")
-else:
-    df_drugs.to_csv('drugs.csv', index=False)
-    df_targets.to_csv('proteins.csv', index=False)
-    df_diseases.to_csv('diseases.csv', index=False)
-    df_drug_target.to_csv('edges_drug_targets.csv', index=False)
-    df_drug_disease.to_csv('edges_drug_treats_disease.csv', index=False)
-    print("Definitive scientific parsing complete. High-quality data saved to CSV files.")
+    # Build DataFrames
+    df_drugs=pd.DataFrame(drugs)
+    df_targets=pd.DataFrame(list(targets.values()))
+    df_drug_target=pd.DataFrame(drug_target_edges)
+    df_drug_disease=pd.DataFrame(drug_disease_edges)
 
+    # cluster and filter
+    if not df_drug_disease.empty:
+        names=list(dict.fromkeys(df_drug_disease['disease_name'].tolist()))
+        if cluster_diseases and FUZZY_OK and names:
+            mapping=fuzzy_cluster(names,threshold=fuzzy_threshold)
+            df_drug_disease['disease_canon']=df_drug_disease['disease_name'].map(lambda x:mapping.get(x,x))
+        else:
+            df_drug_disease['disease_canon']=df_drug_disease['disease_name']
+        support=df_drug_disease.groupby('disease_canon').size().to_dict()
+        keep={d for d,c in support.items() if c>=min_support}
+        df_drug_disease=df_drug_disease[df_drug_disease['disease_canon'].isin(keep)].copy()
+        df_drug_disease=df_drug_disease.drop_duplicates(subset=['drug_id','disease_canon'])
+        df_diseases=pd.DataFrame(sorted(list(keep)),columns=['name'])
+    else:
+        df_diseases=pd.DataFrame(columns=['name'])
+
+    os.makedirs(out_dir, exist_ok=True)
+    df_drugs.to_csv(os.path.join(out_dir,'drugs.csv'),index=False)
+    df_targets.to_csv(os.path.join(out_dir,'proteins.csv'),index=False)
+    df_diseases.to_csv(os.path.join(out_dir,'diseases.csv'),index=False)
+    df_drug_target.to_csv(os.path.join(out_dir,'edges_drug_targets.csv'),index=False)
+    if not df_drug_disease.empty:
+        df_drug_disease[['drug_id','disease_canon']].rename(columns={'disease_canon':'disease_name'}).to_csv(os.path.join(out_dir,'edges_drug_treats_disease.csv'),index=False)
+    else:
+        pd.DataFrame(columns=['drug_id','disease_name']).to_csv(os.path.join(out_dir,'edges_drug_treats_disease.csv'),index=False)
+
+    diagnostics={
+        "num_drugs":int(df_drugs.shape[0]),
+        "num_targets":int(df_targets.shape[0]),
+        "num_drug_target_edges":int(df_drug_target.shape[0]),
+        "num_drug_disease_edges":int(df_drug_disease.shape[0]),
+        "top_20_disease_mentions":disease_counter.most_common(20)
+    }
+    with open(os.path.join(out_dir,'diagnostics.json'),'w') as f: json.dump(diagnostics,f,indent=2)
+    print("Parsing complete. Wrote CSVs to:", os.path.abspath(out_dir))
+    print(json.dumps(diagnostics, indent=2))
+    return diagnostics
+
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--xml', type=str, default=DEFAULT_XML_PATH)
+    parser.add_argument('--out', type=str, default=DEFAULT_OUT)
+    parser.add_argument('--min_support', type=int, default=DEFAULT_MIN_SUPPORT)
+    parser.add_argument('--fuzzy_threshold', type=int, default=DEFAULT_FUZZY_THRESHOLD)
+    parser.add_argument('--min_entity_len', type=int, default=DEFAULT_MIN_ENTITY_LEN)
+    parser.add_argument('--no-cluster', action='store_true')
+    args=parser.parse_args()
+    parse_drugbank(args.xml, args.out, min_support=args.min_support, fuzzy_threshold=args.fuzzy_threshold, min_entity_len=args.min_entity_len, cluster_diseases=(not args.no_cluster))

@@ -1,0 +1,88 @@
+{
+  "num_drugs": 73687,
+  "num_targets": 4457,
+  "num_drug_target_edges": 39321,
+  "num_drug_disease_edges": 16215,
+  "top_20_disease_mentions": [
+    [
+      "tumors",
+      670
+    ],
+    [
+      "breast",
+      464
+    ],
+    [
+      "pain",
+      430
+    ],
+    [
+      "infections",
+      418
+    ],
+    [
+      "schizophrenia",
+      323
+    ],
+    [
+      "rheumatoid arthritis",
+      310
+    ],
+    [
+      "prostate",
+      304
+    ],
+    [
+      "alzheimer s",
+      280
+    ],
+    [
+      "lung",
+      278
+    ],
+    [
+      "diabetes mellitus",
+      248
+    ],
+    [
+      "psoriasis",
+      236
+    ],
+    [
+      "hypertension",
+      231
+    ],
+    [
+      "leukemia",
+      228
+    ],
+    [
+      "depression",
+      228
+    ],
+    [
+      "cancers",
+      221
+    ],
+    [
+      "bleeding",
+      217
+    ],
+    [
+      "fatty acids",
+      217
+    ],
+    [
+      "melanoma",
+      201
+    ],
+    [
+      "nsclc",
+      192
+    ],
+    [
+      "allergic reactions",
+      188
+    ]
+  ]
+}

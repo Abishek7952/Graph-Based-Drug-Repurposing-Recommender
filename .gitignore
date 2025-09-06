@@ -6,6 +6,7 @@ venv/
 full_database.xml
 *.xml.zip
 rawdata/full database.xml
+rawdata/sample.xml
 *.csv
 
 *.pt

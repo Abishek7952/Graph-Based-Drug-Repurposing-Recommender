@@ -1,108 +1,135 @@
-from neo4j import GraphDatabase
+#!/usr/bin/env python3
+"""
+build_neo4j_graph.py
+
+Upload data_cleaning/final_*.csv files into Neo4j using the official Python driver.
+This version has credentials and CSV directory preconfigured,
+so you can run `python build_neo4j_graph.py` without extra arguments.
+"""
+
 import os
+import pandas as pd
+from neo4j import GraphDatabase
 
 # --- Neo4j Connection Details ---
-# Replace with your Neo4j AuraDB URI or local bolt address
-NEO4J_URI = "bolt://localhost:7687" 
+NEO4J_URI = "neo4j://127.0.0.1:7687"
 NEO4J_USER = "neo4j"
-# !!! IMPORTANT: Using the password you provided for the project !!!
-NEO4J_PASSWORD = "12345678"
+NEO4J_PASSWORD = "12345678"   # <--- change if you set a different password
+
+# --- CSV Directory (where data_cleaning/final_*.csv files live) ---
+CSV_DIR = "."   # current directory, adjust if needed
+
+# --- Config ---
+BATCH_SIZE = 1000
+
+def chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i+size]
 
 class Neo4jUploader:
     def __init__(self, uri, user, password):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-        print("Attempting to connect to Neo4j database...")
         try:
-            with self.driver.session() as session:
-                session.run("RETURN 1")
-            print("Successfully connected to Neo4j database.")
+            self.driver = GraphDatabase.driver(uri, auth=(user, password))
+            with self.driver.session() as s:
+                s.run("RETURN 1")
+            print(f"Connected to Neo4j at {uri} as {user}")
         except Exception as e:
-            print(f"ERROR: Could not connect to Neo4j. Please check your credentials and that the database is running. Error details: {e}")
-            self.driver = None # Invalidate driver on connection failure
+            raise RuntimeError(f"Could not connect to Neo4j: {e}")
 
     def close(self):
         if self.driver:
             self.driver.close()
 
-    def run_query(self, query, message):
-        if not self.driver:
-            print("Cannot run query, driver is not connected.")
-            return
-
+    def safe_run(self, cypher, params=None):
         with self.driver.session() as session:
             try:
-                session.run(query)
-                print(f"SUCCESS: {message}")
+                session.run(cypher, params or {})
             except Exception as e:
-                print(f"ERROR executing query for '{message}': {e}")
+                raise RuntimeError(f"Cypher failed: {e}\nQuery: {cypher}")
 
-    def upload_graph(self):
-        if not self.driver:
-            print("Cannot upload graph, not connected to database.")
+    def create_constraints(self):
+        statements = [
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Drug) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Protein) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (dis:Disease) REQUIRE dis.name IS UNIQUE",
+        ]
+        for st in statements:
+            try:
+                self.safe_run(st)
+            except Exception as e:
+                print(f"[constraint ignored] {e}")
+
+    def upload_nodes(self, df, label, id_col, extra_cols=None):
+        if df.empty:
+            print(f"No {label} nodes, skipping.")
             return
-            
-        print("\n--- Step 2: Starting Neo4j Graph Construction ---")
+        print(f"Uploading {len(df)} {label} nodes...")
+        rows = df[[id_col] + (extra_cols or [])].fillna("").to_dict(orient="records")
+        for chunk in chunked(rows, BATCH_SIZE):
+            cypher = f"UNWIND $rows AS r MERGE (n:{label} {{ {id_col}: r['{id_col}'] }})"
+            if extra_cols:
+                set_parts = [f"n.{c} = r['{c}']" for c in extra_cols]
+                cypher += "\nSET " + ", ".join(set_parts)
+            self.safe_run(cypher, {"rows": chunk})
+        print(f"Done uploading {label} nodes.")
 
-        # 1. Create uniqueness constraints for faster loading and data integrity
-        # This ensures you don't create duplicate nodes for the same entity.
-        self.run_query(
-            "CREATE CONSTRAINT drug_id_unique IF NOT EXISTS FOR (d:Drug) REQUIRE d.id IS UNIQUE",
-            "Created uniqueness constraint for Drug nodes."
-        )
-        self.run_query(
-            "CREATE CONSTRAINT protein_id_unique IF NOT EXISTS FOR (p:Protein) REQUIRE p.id IS UNIQUE",
-            "Created uniqueness constraint for Protein nodes."
-        )
-        self.run_query(
-            "CREATE CONSTRAINT disease_name_unique IF NOT EXISTS FOR (dis:Disease) REQUIRE dis.name IS UNIQUE",
-            "Created uniqueness constraint for Disease nodes."
-        )
-
-        # 2. Load Drug nodes
-        self.run_query(
-            "LOAD CSV WITH HEADERS FROM 'file:///drugs.csv' AS row MERGE (d:Drug {id: row.id, name: row.name})",
-            "Loaded all Drug nodes."
-        )
-
-        # 3. Load Protein (Target) nodes
-        self.run_query(
-            "LOAD CSV WITH HEADERS FROM 'file:///proteins.csv' AS row MERGE (p:Protein {id: row.id, name: row.name})",
-            "Loaded all Protein nodes."
-        )
-
-        # 4. Load Disease nodes
-        self.run_query(
-            "LOAD CSV WITH HEADERS FROM 'file:///diseases.csv' AS row MERGE (dis:Disease {name: row.name})",
-            "Loaded all Disease nodes."
-        )
-
-        # 5. Create [:TARGETS] relationships
-        self.run_query(
-            """
-            LOAD CSV WITH HEADERS FROM 'file:///edges_drug_targets.csv' AS row
-            MATCH (d:Drug {id: row.drug_id})
-            MATCH (p:Protein {id: row.target_id})
+    def upload_targets(self, df):
+        if df.empty:
+            print("No TARGETS edges.")
+            return
+        print(f"Uploading {len(df)} TARGETS relationships...")
+        rows = df[["drug_id","target_id"]].dropna().astype(str).to_dict(orient="records")
+        for chunk in chunked(rows, BATCH_SIZE):
+            cypher = """
+            UNWIND $rows AS r
+            MATCH (d:Drug {id: r.drug_id})
+            MATCH (p:Protein {id: r.target_id})
             MERGE (d)-[:TARGETS]->(p)
-            """,
-            "Created all Drug-TARGETS->Protein relationships."
-        )
-
-        # 6. Create [:TREATS] relationships
-        self.run_query(
             """
-            LOAD CSV WITH HEADERS FROM 'file:///edges_drug_treats_disease.csv' AS row
-            MATCH (d:Drug {id: row.drug_id})
-            MATCH (dis:Disease {name: row.disease_name})
-            MERGE (d)-[:TREATS]->(dis)
-            """,
-            "Created all Drug-TREATS->Disease relationships."
-        )
-        
-        print("\n--- Step 2 complete. Your biomedical knowledge graph is now in Neo4j! ---")
+            self.safe_run(cypher, {"rows": chunk})
+        print("Done uploading TARGETS.")
 
+    def upload_treats(self, df):
+        if df.empty:
+            print("No TREATS edges.")
+            return
+        print(f"Uploading {len(df)} TREATS relationships...")
+        rows = df[["drug_id","disease_name"]].dropna().astype(str).to_dict(orient="records")
+        for chunk in chunked(rows, BATCH_SIZE):
+            cypher = """
+            UNWIND $rows AS r
+            MATCH (d:Drug {id: r.drug_id})
+            MATCH (dis:Disease {name: r.disease_name})
+            MERGE (d)-[:TREATS]->(dis)
+            """
+            self.safe_run(cypher, {"rows": chunk})
+        print("Done uploading TREATS.")
+
+def main():
+    # load CSVs
+    f_drugs   = os.path.join(CSV_DIR, "data_cleaning/final_drugs.csv")
+    f_prots   = os.path.join(CSV_DIR, "data_cleaning/final_proteins.csv")
+    f_dis     = os.path.join(CSV_DIR, "data_cleaning/final_diseases.csv")
+    f_edges_dt= os.path.join(CSV_DIR, "data_cleaning/final_edges_drug_targets.csv")
+    f_edges_dd= os.path.join(CSV_DIR, "data_cleaning/final_edges_drug_treats_disease.csv")
+
+    drugs = pd.read_csv(f_drugs, dtype=str).fillna("")
+    prots = pd.read_csv(f_prots, dtype=str).fillna("")
+    dis   = pd.read_csv(f_dis, dtype=str).fillna("")
+    edges_dt = pd.read_csv(f_edges_dt, dtype=str).fillna("")
+    edges_dd = pd.read_csv(f_edges_dd, dtype=str).fillna("")
+
+    uploader = Neo4jUploader(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+    try:
+        uploader.create_constraints()
+        uploader.upload_nodes(drugs, "Drug", "id", ["name"] if "name" in drugs.columns else None)
+        uploader.upload_nodes(prots, "Protein", "id", ["name"] if "name" in prots.columns else None)
+        uploader.upload_nodes(dis, "Disease", "name")
+        uploader.upload_targets(edges_dt)
+        uploader.upload_treats(edges_dd)
+        print("\nGraph upload complete!")
+    finally:
+        uploader.close()
 
 if __name__ == "__main__":
-    uploader = Neo4jUploader(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
-    uploader.upload_graph()
-    uploader.close()
-
+    main()
