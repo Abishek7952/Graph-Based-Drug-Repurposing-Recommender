@@ -2,11 +2,12 @@
 """
 model_training.py (final) — embedding-based, robust hetero-GNN, with better defaults
 
-- Uses learnable nn.Embedding features for each node type (memory-friendly vs identity matrix).
-- Robust manual hetero-GNN implementation (no to_hetero FX).
-- Lower LR, weight decay, increased dropout.
-- Computes Test ROC-AUC and PR-AUC (average precision) after training.
-- Saves model, predictor and embeddings + mappings.
+Changes from previous:
+- Removed Matthews CorrCoef and ranking metrics (Hits@K/MRR).
+- Suppress per-epoch verbose evaluation output and plotting.
+- Save and print ONLY final evaluation summaries + plots for TRAIN and TEST.
+- Compact per-epoch line printed (loss + val ROC + val PR) while tqdm progress runs.
+- All filenames/dirs preserved.
 """
 
 import os
@@ -25,6 +26,12 @@ import pandas as pd
 from torch_geometric.data import HeteroData
 from torch_geometric.transforms import ToUndirected, RandomLinkSplit
 from torch_geometric.nn import SAGEConv
+
+# plotting & metrics
+import matplotlib
+matplotlib.use('Agg')  # for headless saving
+import matplotlib.pyplot as plt
+import numpy as np
 
 # Optional Neo4j import
 try:
@@ -54,6 +61,9 @@ PATIENCE = 8
 
 CHECKPOINT_PATH = "best_checkpoint.pt"
 MODEL_OUT_DIR = "model_out"
+
+# Choose which metric to use for checkpointing: 'roc' (default) or 'pr'
+CHECKPOINT_METRIC = 'roc'  # 'roc' or 'pr'
 
 torch.manual_seed(SEED)
 random.seed(SEED)
@@ -133,6 +143,8 @@ def build_heterodata(graph_dict):
             df.rename(columns={'drug_id':'source','disease_name':'target'}, inplace=True)
 
     if not targets_df.empty:
+        tdf = targets_df[targets_df['source'].isin(drug_map) & targets_edges['target'].isin(protein_map)] if 'targets_edges' in locals() else targets_df
+        # fallback safe building
         tdf = targets_df[targets_df['source'].isin(drug_map) & targets_df['target'].isin(protein_map)].copy()
         src = [drug_map[s] for s in tdf['source'].astype(str)]
         dst = [protein_map[t] for t in tdf['target'].astype(str)]
@@ -249,6 +261,102 @@ class FullModel(nn.Module):
         out = self.predictor(z_pair).view(-1)
         return out, z_dict
 
+# ---------------- Helpers: metrics, plotting (simplified) ----------------
+def _safe_sklearn_imports():
+    try:
+        from sklearn.metrics import (
+            roc_auc_score, average_precision_score, precision_recall_curve,
+            roc_curve, precision_recall_fscore_support, confusion_matrix,
+            brier_score_loss, log_loss
+        )
+        return {
+            'roc_auc_score': roc_auc_score,
+            'average_precision_score': average_precision_score,
+            'precision_recall_curve': precision_recall_curve,
+            'roc_curve': roc_curve,
+            'precision_recall_fscore_support': precision_recall_fscore_support,
+            'confusion_matrix': confusion_matrix,
+            'brier_score_loss': brier_score_loss,
+            'log_loss': log_loss
+        }
+    except Exception as e:
+        print("Warning: sklearn missing or failed to import. Some metrics will be skipped.", e)
+        return None
+
+def save_pr_roc_plots(labs, probs, out_path_pr, out_path_roc, title_suffix=""):
+    sk = _safe_sklearn_imports()
+    if sk is None:
+        return
+    # precision_recall_curve returns (precision, recall, thresholds)
+    precision, recall, _ = sk['precision_recall_curve'](labs, probs)
+    fpr, tpr, _ = sk['roc_curve'](labs, probs)
+
+    # PR curve
+    plt.figure()
+    plt.plot(recall, precision)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"PR Curve {title_suffix}")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path_pr, dpi=150)
+    plt.close()
+
+    # ROC curve
+    plt.figure()
+    plt.plot(fpr, tpr)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve {title_suffix}")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path_roc, dpi=150)
+    plt.close()
+
+def save_confusion_matrix(labs, preds_binary, out_path, title_suffix=""):
+    sk = _safe_sklearn_imports()
+    if sk is None:
+        return
+    cm = sk['confusion_matrix'](labs, preds_binary)
+    plt.figure()
+    plt.imshow(cm, interpolation='nearest')
+    plt.title(f"Confusion Matrix {title_suffix}")
+    plt.colorbar()
+    plt.xlabel('Predicted label')
+    plt.ylabel('True label')
+    tick_marks = np.arange(2)
+    plt.xticks(tick_marks, ['0','1'])
+    plt.yticks(tick_marks, ['0','1'])
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, format(cm[i, j], 'd'), ha="center", va="center")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+def pretty_print_metrics_simple(split_name, roc, pr, prec, rec, f1, lloss, brier, cm_counts, total_samples):
+    sep = "="*70
+    print("\n" + sep)
+    print(f" EVALUATION SUMMARY -> {split_name.upper()}")
+    print(sep)
+    print(f"Samples evaluated : {total_samples}")
+    print(f"ROC AUC           : {roc:.4f}" if roc is not None else "ROC AUC           : N/A")
+    print(f"PR AUC (AP)       : {pr:.4f}" if pr is not None else "PR AUC (AP)       : N/A")
+    print(f"LogLoss           : {lloss:.6f}" if lloss is not None else "LogLoss           : N/A")
+    print(f"Brier score       : {brier:.6f}" if brier is not None else "Brier score       : N/A")
+    print(f"Precision (thr=0.5): {prec:.4f}")
+    print(f"Recall    (thr=0.5): {rec:.4f}")
+    print(f"F1        (thr=0.5): {f1:.4f}")
+    if cm_counts is not None:
+        tn, fp, fn, tp = cm_counts
+        print("\nConfusion Matrix (counts):")
+        print(f"  TN: {tn}   FP: {fp}")
+        print(f"  FN: {fn}   TP: {tp}")
+        pos = tp + fn
+        neg = tn + fp
+        print(f"\nPositives: {pos}, Negatives: {neg}")
+    print(sep + "\n")
+
 # ---------------- Helpers: training / eval ----------------
 def train_epoch(model, optimizer, data_train, device):
     model.train()
@@ -263,7 +371,14 @@ def train_epoch(model, optimizer, data_train, device):
     return float(loss.detach().cpu())
 
 @torch.no_grad()
-def eval_split(model, data_split, device):
+def eval_split(model, data_split, device, split_name="split", save_plots=False, out_dir=MODEL_OUT_DIR, verbose=False):
+    """
+    Simplified eval:
+    - When verbose=False, no print/save occurs (used during epochs).
+    - When verbose=True and save_plots=True, prints a single readable evaluation summary
+      and saves PR/ROC + confusion matrix images to out_dir.
+    Returns: (roc, pr) preserving old interface.
+    """
     model.eval()
     eli = data_split['drug','treats','disease'].edge_label_index.to(device).long()
     labels = data_split['drug','treats','disease'].edge_label.to(device).float()
@@ -271,16 +386,84 @@ def eval_split(model, data_split, device):
     out, _ = model(edge_index_dict, eli)
     probs = torch.sigmoid(out).cpu().numpy()
     labs = labels.cpu().numpy()
-    try:
-        from sklearn.metrics import roc_auc_score, average_precision_score
-        roc = float(roc_auc_score(labs, probs))
-        pr  = float(average_precision_score(labs, probs))
-        return roc, pr
-    except Exception:
-        # fallback to accuracy
-        pred_bin = (probs >= 0.5).astype(int)
-        acc = float((pred_bin == labs).mean())
-        return acc, None
+
+    sk = _safe_sklearn_imports()
+    roc = None
+    pr = None
+    prec = rec = f1 = 0.0
+    cm_counts = None
+    lloss = None
+    brier = None
+
+    if sk is not None:
+        try:
+            roc = float(sk['roc_auc_score'](labs, probs))
+        except Exception:
+            roc = None
+        try:
+            pr = float(sk['average_precision_score'](labs, probs))
+        except Exception:
+            pr = None
+        try:
+            prec, rec, f1, _ = sk['precision_recall_fscore_support'](labs, (probs >= 0.5).astype(int), average='binary', zero_division=0)
+        except Exception:
+            prec = rec = f1 = 0.0
+        try:
+            cm = sk['confusion_matrix'](labs, (probs >= 0.5).astype(int))
+            if cm.size == 4:
+                tn, fp, fn, tp = cm.ravel()
+                cm_counts = (int(tn), int(fp), int(fn), int(tp))
+            else:
+                cm_counts = tuple(int(x) for x in cm.ravel())
+        except Exception:
+            cm_counts = None
+        try:
+            eps = 1e-12
+            lloss = float(sk['log_loss'](labs, np.clip(probs, eps, 1 - eps)))
+        except Exception:
+            lloss = None
+        try:
+            brier = float(sk['brier_score_loss'](labs, probs))
+        except Exception:
+            brier = None
+
+    # Save + print only when requested
+    if verbose:
+        # Ensure dir
+        os.makedirs(out_dir, exist_ok=True)
+        title_suffix = f"{split_name.upper()}"
+        pr_path = os.path.join(out_dir, f"pr_curve_{split_name}.png")
+        roc_path = os.path.join(out_dir, f"roc_curve_{split_name}.png")
+        cm_path = os.path.join(out_dir, f"confusion_matrix_{split_name}.png")
+        # Save plots
+        try:
+            save_pr_roc_plots(labs, probs, pr_path, roc_path, title_suffix=title_suffix)
+        except Exception as e:
+            print("Warning saving PR/ROC plots:", e)
+        try:
+            save_confusion_matrix(labs, (probs >= 0.5).astype(int), cm_path, title_suffix=title_suffix)
+        except Exception as e:
+            print("Warning saving confusion matrix:", e)
+        # Pretty print
+        pretty_print_metrics_simple(split_name=split_name,
+                                    roc=(roc if roc is not None else float('nan')),
+                                    pr=(pr if pr is not None else float('nan')),
+                                    prec=prec, rec=rec, f1=f1,
+                                    lloss=(lloss if lloss is not None else float('nan')),
+                                    brier=(brier if brier is not None else float('nan')),
+                                    cm_counts=cm_counts,
+                                    total_samples=len(labs))
+
+    # Preserve old return signature
+    if roc is not None:
+        return float(roc), (float(pr) if pr is not None else float('nan'))
+    else:
+        try:
+            pred_bin = (probs >= 0.5).astype(int)
+            acc = float((pred_bin == labs).mean())
+            return acc, None
+        except Exception:
+            return None, None
 
 # ---------------- Main ----------------
 def main():
@@ -320,7 +503,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
-    # Build embeddings (learnable) — permanent approach for production
+    # Build embeddings (learnable)
     num_nodes_map = {'drug': data['drug'].num_nodes, 'protein': data['protein'].num_nodes, 'disease': data['disease'].num_nodes}
     print("Num nodes:", num_nodes_map)
 
@@ -357,6 +540,7 @@ def main():
 
     print("Starting training...")
     start_time = time.time()
+    # Use tqdm to show progress; keep prints minimal
     for epoch in tqdm(range(1, NUM_EPOCHS+1), desc="Train epochs"):
         try:
             loss = train_epoch(model, optimizer, train_data, device)
@@ -370,22 +554,36 @@ def main():
                 pass
             raise
 
-        train_roc, train_pr = eval_split(model, train_data, device)
-        val_roc, val_pr = eval_split(model, val_data, device)
-        print(f"Epoch {epoch:03d} Loss {loss:.4f} Train ROC {train_roc:.4f} Train PR {train_pr:.4f} Val ROC {val_roc:.4f} Val PR {val_pr:.4f}")
+        # Evaluate compactly without verbose prints or plots (fast)
+        # We only need val metrics to decide checkpointing and a compact per-epoch line
+        train_roc, train_pr = eval_split(model, train_data, device, split_name="train", save_plots=False, verbose=False)
+        val_roc, val_pr = eval_split(model, val_data, device, split_name="val", save_plots=False, verbose=False)
 
-        if val_roc > best_val + 1e-6:
-            best_val = val_roc
+        # compact single-line epoch summary (no big block prints)
+        # print a single compact line per epoch (this will appear beneath tqdm)
+        print(f"Epoch {epoch:03d} Loss {loss:.4f} | Val ROC {val_roc:.4f} | Val PR {val_pr if val_pr is not None else float('nan'):.4f}")
+
+        # choose checkpointing metric
+        if CHECKPOINT_METRIC == 'pr':
+            current_metric = val_pr if val_pr is not None else -math.inf
+        else:
+            current_metric = val_roc if val_roc is not None else -math.inf
+
+        if current_metric > best_val + 1e-6:
+            best_val = current_metric
             best_epoch = epoch
             no_improve = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'val_metric': current_metric,
                 'val_roc': val_roc,
-                'mappings': maps
+                'val_pr': val_pr,
+                'mappings': maps,
+                'checkpoint_metric': CHECKPOINT_METRIC
             }, CHECKPOINT_PATH)
-            print(f"Checkpoint saved (epoch {epoch}, val_roc {val_roc:.4f})")
+            print(f"Checkpoint saved (epoch {epoch}, val_{CHECKPOINT_METRIC} {current_metric:.4f})")
         else:
             no_improve += 1
 
@@ -394,7 +592,7 @@ def main():
             break
 
     total_time = time.time() - start_time
-    print(f"Training finished in {total_time/60:.2f} minutes. Best val ROC-AUC {best_val:.4f} at epoch {best_epoch}.")
+    print(f"Training finished in {total_time/60:.2f} minutes. Best val {CHECKPOINT_METRIC.upper()} {best_val:.4f} at epoch {best_epoch}.")
 
     # load best checkpoint if exists
     if os.path.exists(CHECKPOINT_PATH):
@@ -402,12 +600,17 @@ def main():
         model.load_state_dict(chk['model_state_dict'])
         print("Loaded best checkpoint.")
 
-    # final evaluation on test
-    test_roc, test_pr = eval_split(model, test_data, device)
-    print(f"Final Test ROC AUC: {test_roc:.4f}")
-    print(f"Final Test PR AUC (avg precision): {test_pr:.4f}" if test_pr is not None else "PR AUC not available")
+    # FINAL: compute and print only final TRAIN and TEST summaries (with plots)
+    print("Computing final TRAIN evaluation and saving plots...")
+    _ = eval_split(model, train_data, device, split_name="train_final", save_plots=True, out_dir=MODEL_OUT_DIR, verbose=True)
 
-    # Save model & embeddings & mappings
+    print("Computing final TEST evaluation and saving plots...")
+    test_roc, test_pr = eval_split(model, test_data, device, split_name="test_final", save_plots=True, out_dir=MODEL_OUT_DIR, verbose=True)
+
+    print(f"Final Test ROC AUC: {test_roc:.4f}" if test_roc is not None else "Final Test ROC AUC: N/A")
+    print(f"Final Test PR AUC (avg precision): {test_pr:.4f}" if test_pr is not None else "Final Test PR AUC (avg precision): N/A")
+
+    # Save model & embeddings & mappings (same filenames as before)
     torch.save(model.state_dict(), os.path.join(MODEL_OUT_DIR, "model_full.pt"))
     # save embedding matrices (from nn.Embedding weights)
     torch.save(model.drug_embed.weight.cpu(), os.path.join(MODEL_OUT_DIR, "embeddings_drug.pt"))
